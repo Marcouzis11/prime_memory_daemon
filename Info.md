@@ -188,14 +188,33 @@ Cada entrada tiene un score entre 0 y 1 que determina su relevancia.
 
 ### ¿Cómo se calcula?
 
-1. **Relevancia inicial**: valor enviado al crear la entrada (default 1.0)
-2. **Feedback positivo**: `useful=true` multiplica el score por 1.05
+1. **Relevancia inicial**: valor enviado en `_meta.relevance` al crear la entrada (default 1.0)
+2. **Feedback positivo**: `useful=true` multiplica el score por 1.05 (capped a 1.0)
 3. **Feedback negativo**: `useful=false` multiplica el score por 0.95
 4. **Decaimiento automático**: score *= 0.95 si la entrada no fue accedida en 7+ días y tiene menos de 3 accesos
 
 ### ¿Cómo afecta la búsqueda?
 
 Los resultados de `GET /context` se ordenan por score descendente por defecto, mostrando primero las memorias más relevantes.
+
+---
+
+## Notas de Implementación
+
+### Thread Safety
+
+- `projectDBs` usa `sync.Map` para acceso concurrente seguro desde múltiples goroutines
+- Métricas globales protegidas con `sync.RWMutex`
+
+### Routing
+
+Los endpoints están registrados en orden específico para evitar ambigüedades:
+1. `/context/export` se registra primero
+2. `/context/` para feedback y operaciones CRUD
+
+### Validación de Proyectos
+
+Todos los endpoints que operan sobre entries (PATCH, DELETE) validan que el proyecto esté registrado antes de proceder.
 
 ---
 

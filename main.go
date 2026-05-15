@@ -91,6 +91,24 @@ func logJSON(level, msg, project, category, entryID, errMsg string) {
 	log.Println(string(b))
 }
 
+func incRequests() {
+	metricsMu.Lock()
+	totalRequests++
+	metricsMu.Unlock()
+}
+
+func incErrors() {
+	metricsMu.Lock()
+	totalErrors++
+	metricsMu.Unlock()
+}
+
+func incCompressions() {
+	metricsMu.Lock()
+	totalCompressions++
+	metricsMu.Unlock()
+}
+
 func generateEntryID() string {
 	bytes := make([]byte, 8)
 	rand.Read(bytes)
@@ -104,6 +122,7 @@ type EntryMeta struct {
 	TaskState        string   `json:"task_state"`
 	TaskStatusCode   int      `json:"task_status_code"`
 	TaskSummary      string   `json:"task_summary"`
+	Relevance        float64  `json:"relevance"`
 }
 
 type UpdateRequest struct {
@@ -316,18 +335,6 @@ func shouldCompress(projectDir string) (map[string]bool, error) {
 }
 */
 
-func getProjectDB(projectDir string) (*DB, error) {
-	if db, ok := projectDBs[projectDir]; ok {
-		return db, nil
-	}
-	db, err := InitDB(projectDir)
-	if err != nil {
-		return nil, err
-	}
-	projectDBs[projectDir] = db
-	return db, nil
-}
-
 func getContext(projectDir string) ([]Memory, error) {
 	db, err := getProjectDB(projectDir)
 	if err != nil {
@@ -345,13 +352,17 @@ func updateContext(projectDir string, updates map[string]string, meta EntryMeta)
 	for key, content := range updates {
 		entryID := generateEntryID()
 		tags := strings.Join(meta.AgentPermissions, ",")
+		score := meta.Relevance
+		if score <= 0 || score > 1 {
+			score = 1.0
+		}
 		m := &Memory{
 			ID:             entryID,
 			Project:        projectDir,
 			Category:       key,
 			Content:        content,
 			Tags:           tags,
-			Score:          1.0,
+			Score:          score,
 			SessionID:      meta.SessionID,
 			AgentType:      meta.AgentType,
 			TaskState:      meta.TaskState,
@@ -496,7 +507,28 @@ func listProjects(pm *ProjectManager) ([]string, error) {
 
 var pm *ProjectManager
 var database *DB
-var projectDBs = map[string]*DB{}
+var projectDBs = sync.Map{}
+
+func getProjectDB(projectDir string) (*DB, error) {
+	if db, ok := projectDBs.Load(projectDir); ok {
+		return db.(*DB), nil
+	}
+	db, err := InitDB(projectDir)
+	if err != nil {
+		return nil, err
+	}
+	projectDBs.Store(projectDir, db)
+	return db, nil
+}
+
+func countProjectDBs() int {
+	count := 0
+	projectDBs.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	return count
+}
 
 func main() {
 	defaultDir, _ := os.Getwd()
@@ -506,7 +538,7 @@ func main() {
 		fmt.Println("Error initializing database:", err)
 		os.Exit(1)
 	}
-	projectDBs[defaultDir] = database
+	projectDBs.Store(defaultDir, database)
 	defer database.Close()
 
 	pm = NewProjectManager(database)
@@ -521,7 +553,7 @@ func main() {
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		metricsMu.RLock()
 		uptime := int64(time.Since(startTime).Seconds())
-		activeProjects := int64(len(projectDBs))
+		activeProjects := int64(countProjectDBs())
 		tr := totalRequests
 		te := totalErrors
 		tc := totalCompressions
@@ -542,6 +574,7 @@ func main() {
 	})
 
 	http.HandleFunc("/projects", func(w http.ResponseWriter, r *http.Request) {
+		incRequests()
 		switch r.Method {
 		case http.MethodGet:
 			projects, err := listProjects(pm)
@@ -575,6 +608,7 @@ func main() {
 	})
 
 	http.HandleFunc("/context", func(w http.ResponseWriter, r *http.Request) {
+		incRequests()
 		projectDir := getProjectDir(r)
 
 		if !pm.isProjectRegistered(projectDir) {
@@ -749,20 +783,9 @@ func main() {
 			result["all"] = map[string]int{"entries_archived": count}
 		}
 
+		incCompressions()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "compressed": result})
-	})
-
-	http.HandleFunc("/context/", func(w http.ResponseWriter, r *http.Request) {
-		projectDir := getProjectDir(r)
-
-		if !pm.isProjectRegistered(projectDir) {
-			http.Error(w, "Project not found", 404)
-			return
-		}
-
-		// Legacy file-based operations - now handled by SQLite via contextFeedbackHandler
-		http.Error(w, "Not found", 404)
 	})
 
 	http.HandleFunc("/context/export", exportMemoriesHandler)
@@ -833,6 +856,11 @@ func contextFeedbackHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	projectDir := getProjectDir(r)
+	if !pm.isProjectRegistered(projectDir) {
+		http.Error(w, "Project not found", 404)
+		return
+	}
+
 	db, err := getProjectDB(projectDir)
 	if err != nil {
 		http.Error(w, "Error getting DB", 500)
